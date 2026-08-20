@@ -19,6 +19,7 @@ import static de.robv.android.xposed.XposedHelpers.setBooleanField;
 import static de.robv.android.xposed.XposedHelpers.setObjectField;
 
 import android.app.Instrumentation;
+import android.app.KeyguardManager;
 import android.content.BroadcastReceiver;
 import android.content.Context;
 import android.content.Intent;
@@ -66,6 +67,9 @@ import de.robv.android.xposed.XSharedPreferences;
 import de.robv.android.xposed.callbacks.XC_LoadPackage;
 
 public class Main implements IXposedHookZygoteInit, IXposedHookLoadPackage {
+    private static final int IME_VISIBLE = 2;
+    private static final long CURSOR_CHORD_DELAY_MILLIS = 180L;
+
     private InputMethodService mService;
     private final ArrayMap<String, Long> mLastTimestamps = new ArrayMap<>();
     private boolean mVolumeLongPress;
@@ -96,7 +100,12 @@ public class Main implements IXposedHookZygoteInit, IXposedHookLoadPackage {
     BroadcastReceiver mReceiver = new BroadcastReceiver() {
         @Override
         public void onReceive(Context context, Intent intent) {
-            updatePreferences(intent);
+            if (Intent.ACTION_USER_UNLOCKED.equals(intent.getAction())) {
+                reloadPreferences();
+                log("DarkTricks: preferences reloaded after user unlock, cursorControl=" + mCursorControl);
+            } else {
+                updatePreferences(intent);
+            }
         }
     };
     private int mCursorControl;
@@ -133,35 +142,32 @@ public class Main implements IXposedHookZygoteInit, IXposedHookLoadPackage {
     private Object mEdgeBackGestureHandler;
     private boolean mOutlookPolicy;
     private boolean mPhoneRecorder;
+    private volatile Object mInputMethodManagerService;
+    private volatile boolean mImeWindowVisible;
+    private boolean mImeVisibilityReadErrorLogged;
+    private final Object mCursorKeyLock = new Object();
+    private boolean mPowerKeyPressed;
+    private boolean mVolumeUpPressed;
+    private boolean mVolumeDownPressed;
+    private boolean mCursorChordActive;
+    private boolean mHandlingVolumeUp;
+    private boolean mHandlingVolumeDown;
+    private KeyEvent mPendingCursorDownEvent;
+    private int mPendingCursorGeneration;
+    private boolean mSystemVolumeHookLogged;
+    private boolean mPolicyVolumeHookLogged;
+    private boolean mCursorConversionLogged;
 
     public void initZygote(IXposedHookZygoteInit.StartupParam startupParam) {
         if (prefs == null) {
             prefs = new XSharedPreferences("com.darkeyes.tricks", "com.darkeyes.tricks_shared");
-            mCursorControl = Integer.parseInt(prefs.getString("trick_cursorControl", "0"));
-            mHideAdbNotification = prefs.getBoolean("trick_hideAdbNotification", false);
-            mDoubleTapToSleep = prefs.getBoolean("trick_doubleTapToSleep", false);
-            mQuickPulldown = Integer.parseInt(prefs.getString("trick_quickPulldown", "0"));
-            mSkipTrack = prefs.getBoolean("trick_skipTrack", false);
-            mPowerTorch = prefs.getBoolean("trick_powerTorch", false);
-            mProximityWakeUp = prefs.getBoolean("trick_proximityWakeUp", false);
-            mLessNotifications = Integer.parseInt(prefs.getString("trick_lessNotifications", "0"));
-            mScreenOffNotifications = prefs.getBoolean("trick_screenOffNotifications", false);
-            mHideLtePlus = prefs.getBoolean("trick_hideLtePlus", false);
-            mShow4gForLte = prefs.getBoolean("trick_show4gForLte", false);
-            mHideNextAlarm = prefs.getBoolean("trick_hideNextAlarm", false);
-            mHideVpn = prefs.getBoolean("trick_hideVpn", false);
-            mHideCert = prefs.getBoolean("trick_hideCert", false);
-            mHideAdGuard = prefs.getBoolean("trick_hideAdGuard", false);
-            mCircleActiveApps = prefs.getBoolean("trick_circleActiveApps", false);
-            mHideBuildVersion = prefs.getBoolean("trick_hideBuildVersion", false);
-            mCustomCarrierText = prefs.getString("trick_customCarrierText", "");
-            mGestureHeight = Integer.parseInt(prefs.getString("trick_gestureHeight", "0"));
-            mOutlookPolicy = prefs.getBoolean("trick_OutlookPolicy", false);
-            mPhoneRecorder = prefs.getBoolean("trick_PhoneRecorder", false);
         }
+        reloadPreferences();
+        mFilter.addAction(Intent.ACTION_USER_UNLOCKED);
         findAndHookMethodIfExists("android.inputmethodservice.InputMethodService", null, "onCreate", new XC_MethodHook() {
             @Override
             protected void afterHookedMethod(MethodHookParam param) {
+                reloadPreferences();
                 mService = (InputMethodService) param.thisObject;
                 if (mContext == null) {
                     mContext = (Context) param.thisObject;
@@ -197,6 +203,7 @@ public class Main implements IXposedHookZygoteInit, IXposedHookLoadPackage {
     }
     public void handleLoadPackage(XC_LoadPackage.LoadPackageParam param) {
         if (param.packageName.equals("android")) {
+            hookSystemServerCursorControl(param.classLoader);
             findAndHookMethodIfExists("com.android.server.policy.PhoneWindowManager", param.classLoader, "initKeyCombinationRules", new XC_MethodHook() {
                 @Override
                 protected void afterHookedMethod(MethodHookParam param) {
@@ -207,6 +214,8 @@ public class Main implements IXposedHookZygoteInit, IXposedHookLoadPackage {
 
                     if (mPowerManager == null)
                         mPowerManager = (PowerManager) mContext.getSystemService(Context.POWER_SERVICE);
+                    if (mHandler == null)
+                        mHandler = (Handler) getObjectField(param.thisObject, "mHandler");
                     if (mSensorManager == null)
                         mSensorManager = (SensorManager) mContext.getSystemService(Context.SENSOR_SERVICE);
                     if (mProximitySensor == null)
@@ -289,6 +298,26 @@ public class Main implements IXposedHookZygoteInit, IXposedHookLoadPackage {
                 protected void beforeHookedMethod(MethodHookParam param) {
                     KeyEvent event = (KeyEvent) param.args[0];
                     int keyCode = event.getKeyCode();
+                    if (isReplayedVolumeEvent(event))
+                        return;
+
+                    KeyEvent chordEvent = trackCursorChord(event);
+                    if (chordEvent != null)
+                        injectReplayedVolumeEvent(chordEvent);
+
+                    if ((keyCode == KeyEvent.KEYCODE_VOLUME_UP || keyCode == KeyEvent.KEYCODE_VOLUME_DOWN)
+                            && !mPolicyVolumeHookLogged) {
+                        mPolicyVolumeHookLogged = true;
+                        log("DarkTricks: PhoneWindowManager volume hook is active");
+                    }
+                    if (handleSystemVolumeKey(event)) {
+                        if (!mCursorConversionLogged) {
+                            mCursorConversionLogged = true;
+                            log("DarkTricks: converting volume keys to cursor keys");
+                        }
+                        param.setResult(0);
+                        return;
+                    }
                     Context context = (Context) getObjectField(param.thisObject, "mContext");
                     Handler handler = (Handler) getObjectField(param.thisObject, "mHandler");
                     final PowerManager.WakeLock wakeLockTorch = mPowerManager.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "DarkTricks:Torch");
@@ -849,6 +878,295 @@ public class Main implements IXposedHookZygoteInit, IXposedHookLoadPackage {
             });
         }
     }
+
+    private void hookSystemServerCursorControl(ClassLoader classLoader) {
+        hookAllConstructorsIfExists("com.android.server.inputmethod.InputMethodManagerService", classLoader, new XC_MethodHook() {
+            @Override
+            protected void afterHookedMethod(MethodHookParam param) {
+                mInputMethodManagerService = param.thisObject;
+            }
+        });
+
+        hookAllMethodsIfExists("com.android.server.inputmethod.InputMethodManagerService", classLoader,
+                "setImeWindowStatusLocked", new XC_MethodHook() {
+                    @Override
+                    protected void afterHookedMethod(MethodHookParam param) {
+                        mInputMethodManagerService = param.thisObject;
+                        if (param.args.length > 0 && param.args[0] instanceof Integer)
+                            mImeWindowVisible = (((Integer) param.args[0]) & IME_VISIBLE) != 0;
+                    }
+                });
+
+        hookAllMethodsIfExists("android.media.session.MediaSessionLegacyHelper", classLoader,
+                "sendVolumeKeyEvent", new XC_MethodHook() {
+                    @Override
+                    protected void beforeHookedMethod(MethodHookParam param) {
+                        if (param.args.length < 3 || !(param.args[0] instanceof KeyEvent)
+                                || !(param.args[2] instanceof Boolean) || !((Boolean) param.args[2]))
+                            return;
+
+                        if (handleSystemVolumeKey((KeyEvent) param.args[0]))
+                            param.setResult(null);
+                    }
+                });
+
+        hookAllMethodsIfExists("com.android.server.media.MediaSessionService$SessionManagerImpl", classLoader,
+                "dispatchVolumeKeyEvent", new XC_MethodHook() {
+                    @Override
+                    protected void beforeHookedMethod(MethodHookParam param) {
+                        if (param.args.length < 6 || !(param.args[3] instanceof KeyEvent)
+                                || !(param.args[5] instanceof Boolean) || !((Boolean) param.args[5]))
+                            return;
+
+                        if (!mSystemVolumeHookLogged) {
+                            mSystemVolumeHookLogged = true;
+                            log("DarkTricks: MediaSessionService volume hook is active");
+                        }
+                        if (handleSystemVolumeKey((KeyEvent) param.args[3]))
+                            param.setResult(null);
+                    }
+                });
+
+        log("DarkTricks: installed system_server cursor-control hooks");
+    }
+
+    private KeyEvent trackCursorChord(KeyEvent event) {
+        int keyCode = event.getKeyCode();
+        int action = event.getAction();
+        KeyEvent chordEvent = null;
+
+        synchronized (mCursorKeyLock) {
+            if (keyCode == KeyEvent.KEYCODE_POWER) {
+                if (action == KeyEvent.ACTION_DOWN && event.getRepeatCount() == 0) {
+                    mPowerKeyPressed = true;
+                    if (mVolumeUpPressed || mVolumeDownPressed) {
+                        mCursorChordActive = true;
+                        chordEvent = takePendingCursorDownLocked();
+                    }
+                } else if (action == KeyEvent.ACTION_UP) {
+                    mPowerKeyPressed = false;
+                }
+            } else if ((keyCode == KeyEvent.KEYCODE_VOLUME_UP || keyCode == KeyEvent.KEYCODE_VOLUME_DOWN)
+                    && action == KeyEvent.ACTION_DOWN && event.getRepeatCount() == 0) {
+                if (!mVolumeUpPressed && !mVolumeDownPressed)
+                    mCursorChordActive = false;
+
+                if (keyCode == KeyEvent.KEYCODE_VOLUME_UP)
+                    mVolumeUpPressed = true;
+                else
+                    mVolumeDownPressed = true;
+
+                if (mPowerKeyPressed || (mVolumeUpPressed && mVolumeDownPressed)) {
+                    mCursorChordActive = true;
+                    chordEvent = takePendingCursorDownLocked();
+                }
+            } else if ((keyCode == KeyEvent.KEYCODE_VOLUME_UP || keyCode == KeyEvent.KEYCODE_VOLUME_DOWN)
+                    && action == KeyEvent.ACTION_UP) {
+                if (keyCode == KeyEvent.KEYCODE_VOLUME_UP)
+                    mVolumeUpPressed = false;
+                else
+                    mVolumeDownPressed = false;
+            }
+        }
+        return chordEvent;
+    }
+
+    private boolean handleSystemVolumeKey(KeyEvent event) {
+        int volumeKeyCode = event.getKeyCode();
+        if (volumeKeyCode != KeyEvent.KEYCODE_VOLUME_UP && volumeKeyCode != KeyEvent.KEYCODE_VOLUME_DOWN)
+            return false;
+
+        int action = event.getAction();
+        KeyEvent pendingDown = null;
+        boolean injectCurrentEvent = false;
+
+        synchronized (mCursorKeyLock) {
+            boolean handling = isHandlingVolumeLocked(volumeKeyCode);
+            if (mCursorChordActive) {
+                if (action == KeyEvent.ACTION_UP && handling)
+                    setHandlingVolumeLocked(volumeKeyCode, false);
+                if (action == KeyEvent.ACTION_UP && !mVolumeUpPressed && !mVolumeDownPressed)
+                    mCursorChordActive = false;
+                return false;
+            }
+
+            if (action == KeyEvent.ACTION_DOWN && event.getRepeatCount() == 0) {
+                if (!isCursorControlAvailable())
+                    return false;
+
+                setHandlingVolumeLocked(volumeKeyCode, true);
+                if (!mCursorChordActive) {
+                    if (mHandler != null) {
+                        scheduleCursorDownLocked(event);
+                    } else {
+                        injectCurrentEvent = true;
+                    }
+                }
+            } else if (!handling) {
+                return false;
+            } else if (action == KeyEvent.ACTION_DOWN) {
+                if (!mCursorChordActive)
+                    injectCurrentEvent = true;
+            } else if (action == KeyEvent.ACTION_UP) {
+                if (!mCursorChordActive) {
+                    pendingDown = takePendingCursorDownLocked(volumeKeyCode);
+                    injectCurrentEvent = true;
+                } else {
+                    cancelPendingCursorDownLocked();
+                }
+
+                setHandlingVolumeLocked(volumeKeyCode, false);
+                if (!mVolumeUpPressed && !mVolumeDownPressed)
+                    mCursorChordActive = false;
+            }
+        }
+
+        if (pendingDown != null)
+            injectCursorKeyEvent(pendingDown);
+        if (injectCurrentEvent)
+            injectCursorKeyEvent(event);
+        return true;
+    }
+
+    private boolean isCursorControlAvailable() {
+        if (mCursorControl <= 0)
+            return false;
+        if (mPowerManager != null && !mPowerManager.isInteractive())
+            return false;
+        if (mTelephonyManager != null && mTelephonyManager.getCallState() != TelephonyManager.CALL_STATE_IDLE)
+            return false;
+        if (mAudioManager != null && (mAudioManager.getMode() == AudioManager.MODE_IN_CALL
+                || mAudioManager.getMode() == AudioManager.MODE_IN_COMMUNICATION))
+            return false;
+
+        if (mContext != null) {
+            KeyguardManager keyguardManager = (KeyguardManager) mContext.getSystemService(Context.KEYGUARD_SERVICE);
+            if (keyguardManager != null && keyguardManager.isKeyguardLocked())
+                return false;
+        }
+        return isImeVisible();
+    }
+
+    private boolean isImeVisible() {
+        Object service = mInputMethodManagerService;
+        if (service == null)
+            return mImeWindowVisible;
+
+        try {
+            int currentUserId = getIntField(service, "mCurrentImeUserId");
+            Object userData = callMethod(service, "getUserData", currentUserId);
+            Object bindingController = getObjectField(userData, "mBindingController");
+            int visibility = (Integer) callMethod(bindingController, "getImeWindowVis");
+            mImeWindowVisible = (visibility & IME_VISIBLE) != 0;
+        } catch (Throwable throwable) {
+            if (!mImeVisibilityReadErrorLogged) {
+                mImeVisibilityReadErrorLogged = true;
+                log("DarkTricks: failed to read current IME visibility: " + throwable);
+            }
+        }
+        return mImeWindowVisible;
+    }
+
+    private void scheduleCursorDownLocked(KeyEvent event) {
+        int generation = ++mPendingCursorGeneration;
+        mPendingCursorDownEvent = new KeyEvent(event);
+        mHandler.postDelayed(() -> dispatchPendingCursorDown(generation), CURSOR_CHORD_DELAY_MILLIS);
+    }
+
+    private void dispatchPendingCursorDown(int generation) {
+        KeyEvent event;
+        synchronized (mCursorKeyLock) {
+            if (generation != mPendingCursorGeneration || mPendingCursorDownEvent == null
+                    || mCursorChordActive
+                    || !isHandlingVolumeLocked(mPendingCursorDownEvent.getKeyCode()))
+                return;
+
+            event = mPendingCursorDownEvent;
+            mPendingCursorDownEvent = null;
+        }
+        injectCursorKeyEvent(event);
+    }
+
+    private KeyEvent takePendingCursorDownLocked(int volumeKeyCode) {
+        if (mPendingCursorDownEvent == null || mPendingCursorDownEvent.getKeyCode() != volumeKeyCode)
+            return null;
+
+        return takePendingCursorDownLocked();
+    }
+
+    private KeyEvent takePendingCursorDownLocked() {
+        KeyEvent event = mPendingCursorDownEvent;
+        cancelPendingCursorDownLocked();
+        return event;
+    }
+
+    private void cancelPendingCursorDownLocked() {
+        mPendingCursorGeneration++;
+        mPendingCursorDownEvent = null;
+    }
+
+    private boolean isHandlingVolumeLocked(int keyCode) {
+        return keyCode == KeyEvent.KEYCODE_VOLUME_UP ? mHandlingVolumeUp : mHandlingVolumeDown;
+    }
+
+    private void setHandlingVolumeLocked(int keyCode, boolean handling) {
+        if (keyCode == KeyEvent.KEYCODE_VOLUME_UP)
+            mHandlingVolumeUp = handling;
+        else
+            mHandlingVolumeDown = handling;
+    }
+
+    private boolean isReplayedVolumeEvent(KeyEvent event) {
+        int keyCode = event.getKeyCode();
+        return (keyCode == KeyEvent.KEYCODE_VOLUME_UP || keyCode == KeyEvent.KEYCODE_VOLUME_DOWN)
+                && (event.getFlags() & KeyEvent.FLAG_EDITOR_ACTION) != 0;
+    }
+
+    private void injectReplayedVolumeEvent(KeyEvent volumeEvent) {
+        if (mContext == null)
+            return;
+
+        int flags = volumeEvent.getFlags() | KeyEvent.FLAG_FROM_SYSTEM | KeyEvent.FLAG_EDITOR_ACTION;
+        KeyEvent replayEvent = new KeyEvent(volumeEvent.getDownTime(), SystemClock.uptimeMillis(),
+                volumeEvent.getAction(), volumeEvent.getKeyCode(), volumeEvent.getRepeatCount(),
+                volumeEvent.getMetaState(), KeyCharacterMap.VIRTUAL_KEYBOARD, volumeEvent.getScanCode(),
+                flags, volumeEvent.getSource());
+        try {
+            try {
+                callMethod(replayEvent, "setDisplayId", callMethod(volumeEvent, "getDisplayId"));
+            } catch (Throwable ignored) {
+            }
+            Object inputManager = mContext.getSystemService(Context.INPUT_SERVICE);
+            callMethod(inputManager, "injectInputEvent", replayEvent, 0);
+        } catch (Throwable throwable) {
+            log("DarkTricks: failed to replay volume key for chord: " + throwable);
+        }
+    }
+
+    private void injectCursorKeyEvent(KeyEvent volumeEvent) {
+        int cursorKeyCode;
+        if (volumeEvent.getKeyCode() == KeyEvent.KEYCODE_VOLUME_UP)
+            cursorKeyCode = mCursorControl == 1 ? KeyEvent.KEYCODE_DPAD_LEFT : KeyEvent.KEYCODE_DPAD_RIGHT;
+        else
+            cursorKeyCode = mCursorControl == 1 ? KeyEvent.KEYCODE_DPAD_RIGHT : KeyEvent.KEYCODE_DPAD_LEFT;
+
+        int flags = volumeEvent.getFlags() | KeyEvent.FLAG_FROM_SYSTEM | KeyEvent.FLAG_VIRTUAL_HARD_KEY;
+        KeyEvent cursorEvent = new KeyEvent(volumeEvent.getDownTime(), SystemClock.uptimeMillis(),
+                volumeEvent.getAction(), cursorKeyCode, volumeEvent.getRepeatCount(),
+                volumeEvent.getMetaState(), KeyCharacterMap.VIRTUAL_KEYBOARD, 0, flags,
+                InputDevice.SOURCE_KEYBOARD);
+        try {
+            try {
+                callMethod(cursorEvent, "setDisplayId", callMethod(volumeEvent, "getDisplayId"));
+            } catch (Throwable ignored) {
+            }
+            Object inputManager = mContext.getSystemService(Context.INPUT_SERVICE);
+            callMethod(inputManager, "injectInputEvent", cursorEvent, 0);
+        } catch (Throwable throwable) {
+            log("DarkTricks: failed to inject cursor key: " + throwable);
+        }
+    }
+
     private void updatePreferences(Intent intent) {
         Bundle extras = intent.getExtras();
         String key = extras.getString("preference");
@@ -912,6 +1230,34 @@ public class Main implements IXposedHookZygoteInit, IXposedHookLoadPackage {
             mOutlookPolicy = extras.getBoolean("value");
         else if ("trick_PhoneRecorder".equals(key))
             mPhoneRecorder = extras.getBoolean("value");
+    }
+
+    private void reloadPreferences() {
+        if (prefs == null)
+            return;
+
+        prefs.reload();
+        mCursorControl = Integer.parseInt(prefs.getString("trick_cursorControl", "0"));
+        mHideAdbNotification = prefs.getBoolean("trick_hideAdbNotification", false);
+        mDoubleTapToSleep = prefs.getBoolean("trick_doubleTapToSleep", false);
+        mQuickPulldown = Integer.parseInt(prefs.getString("trick_quickPulldown", "0"));
+        mSkipTrack = prefs.getBoolean("trick_skipTrack", false);
+        mPowerTorch = prefs.getBoolean("trick_powerTorch", false);
+        mProximityWakeUp = prefs.getBoolean("trick_proximityWakeUp", false);
+        mLessNotifications = Integer.parseInt(prefs.getString("trick_lessNotifications", "0"));
+        mScreenOffNotifications = prefs.getBoolean("trick_screenOffNotifications", false);
+        mHideLtePlus = prefs.getBoolean("trick_hideLtePlus", false);
+        mShow4gForLte = prefs.getBoolean("trick_show4gForLte", false);
+        mHideNextAlarm = prefs.getBoolean("trick_hideNextAlarm", false);
+        mHideVpn = prefs.getBoolean("trick_hideVpn", false);
+        mHideCert = prefs.getBoolean("trick_hideCert", false);
+        mHideAdGuard = prefs.getBoolean("trick_hideAdGuard", false);
+        mCircleActiveApps = prefs.getBoolean("trick_circleActiveApps", false);
+        mHideBuildVersion = prefs.getBoolean("trick_hideBuildVersion", false);
+        mCustomCarrierText = prefs.getString("trick_customCarrierText", "");
+        mGestureHeight = Integer.parseInt(prefs.getString("trick_gestureHeight", "0"));
+        mOutlookPolicy = prefs.getBoolean("trick_OutlookPolicy", false);
+        mPhoneRecorder = prefs.getBoolean("trick_PhoneRecorder", false);
     }
     private void findAndHookMethodIfExists(Class<?> clazz, String methodName, Object... parameterTypesAndCallback) {
         Method method = findMethodExactIfExists(clazz, methodName, parameterTypesAndCallback);

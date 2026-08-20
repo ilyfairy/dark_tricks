@@ -2,39 +2,42 @@ apply plugin: 'com.android.application'
 
 def keystorePropertiesFile = rootProject.file("keystore.properties");
 def keystoreProperties = new Properties()
-keystoreProperties.load(new FileInputStream(keystorePropertiesFile))
+if (keystorePropertiesFile.exists()) {
+    keystoreProperties.load(new FileInputStream(keystorePropertiesFile))
+}
 
 android {
     namespace 'com.darkeyes.tricks'
     signingConfigs {
-        release {
-            storeFile file(keystoreProperties['storeFile'])
-            storePassword keystoreProperties['storePassword']
-            keyAlias keystoreProperties['keyAlias']
-            keyPassword keystoreProperties['keyPassword']
+        if (keystorePropertiesFile.exists()) {
+            release {
+                storeFile file(keystoreProperties['storeFile'])
+                storePassword keystoreProperties['storePassword']
+                keyAlias keystoreProperties['keyAlias']
+                keyPassword keystoreProperties['keyPassword']
+            }
         }
     }
-    compileSdk 34
+    compileSdk 35
     defaultConfig {
         applicationId "com.darkeyes.tricks"
         minSdk 34
         targetSdk 34
-        versionCode 43
-        versionName '3.4'
-        signingConfig signingConfigs.release
+        versionCode 46
+        versionName '3.4-coloros3'
     }
     buildTypes {
         release {
             minifyEnabled false
             proguardFiles getDefaultProguardFile('proguard-android.txt'), 'proguard-rules.pro'
-            signingConfig signingConfigs.release
+            signingConfig keystorePropertiesFile.exists() ? signingConfigs.release : signingConfigs.debug
         }
     }
     compileOptions {
         sourceCompatibility = 17
         targetCompatibility = 17
     }
-    buildToolsVersion '34.0.0'
+    buildToolsVersion '35.0.1'
     ndkVersion '26.0.10792818'
 }
 
